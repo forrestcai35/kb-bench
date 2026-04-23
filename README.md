@@ -1,4 +1,4 @@
-# Lore Benchmark Harness
+# Knowledge Base Benchmark Harness
 
 Measures how efficiently an LLM agent can answer operational questions against **Lore**, **Notion**, **Confluence**, and **Obsidian** using each platform's standard agent-facing tools.
 

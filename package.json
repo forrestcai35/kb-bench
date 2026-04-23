@@ -1,9 +1,25 @@
 {
-  "name": "agent-kb-benchmark",
-  "version": "0.1.0",
-  "description": "Benchmark harness measuring how efficiently an LLM agent answers operational questions against Lore, Notion, Confluence, and Obsidian using each platform's native agent tools.",
+  "name": "kb-bench",
+  "version": "0.2.0",
+  "description": "An open benchmark for agentic knowledge-base retrieval. Measures, per query per platform, how many tokens a single LLM agent reads, how long it takes, how many tool calls it makes, and how correct its final answer is.",
   "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/forrestcai/kb-bench"
+  },
+  "keywords": [
+    "benchmark",
+    "knowledge-base",
+    "rag",
+    "retrieval",
+    "agent",
+    "llm",
+    "notion",
+    "confluence",
+    "obsidian",
+    "evaluation"
+  ],
   "scripts": {
     "bench": "tsx src/index.ts",
     "judge": "tsx src/judge.ts",
