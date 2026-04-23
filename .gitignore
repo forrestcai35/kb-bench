@@ -1,0 +1,8 @@
+node_modules/
+results/*.json
+results/*.md
+!results/.gitkeep
+.env
+.env.local
+
+google_service_key.json
