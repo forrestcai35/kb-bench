@@ -5,6 +5,29 @@ import { loadCorpus } from "../src/dataset.js";
 import { encodeVaultPath } from "../src/adapters/obsidian.js";
 import type { CorpusDocument } from "../src/types.js";
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function resolveWorkspaceUuid(
+  supabase: SupabaseClient,
+  workspaceIdOrSlug: string,
+): Promise<string> {
+  if (UUID_RE.test(workspaceIdOrSlug)) return workspaceIdOrSlug;
+  const { data, error } = await supabase
+    .from("workspaces")
+    .select("id")
+    .eq("slug", workspaceIdOrSlug)
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    throw new Error(`Workspace slug lookup failed for "${workspaceIdOrSlug}": ${error.message}`);
+  }
+  const id = (data as { id?: string } | null)?.id;
+  if (!id) {
+    throw new Error(`No workspace found with slug "${workspaceIdOrSlug}".`);
+  }
+  return id;
+}
+
 async function resolveBenchmarkFolderId(
   supabase: SupabaseClient,
   workspaceId: string,
@@ -55,9 +78,14 @@ async function seedLore(docs: CorpusDocument[]): Promise<void> {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
+  const workspaceUuid = await resolveWorkspaceUuid(supabase, config.lore.workspaceId);
+  if (workspaceUuid !== config.lore.workspaceId) {
+    console.log(`  [info] Resolved workspace slug "${config.lore.workspaceId}" → ${workspaceUuid}`);
+  }
+
   const folderId = await resolveBenchmarkFolderId(
     supabase,
-    config.lore.workspaceId,
+    workspaceUuid,
     config.lore.folderName,
   );
 
@@ -69,7 +97,7 @@ async function seedLore(docs: CorpusDocument[]): Promise<void> {
       source: "Agent",
       status: "Published",
       author: config.lore.author,
-      workspace_id: config.lore.workspaceId,
+      workspace_id: workspaceUuid,
       user_id: config.lore.userId,
     };
     if (folderId) payload.folder_id = folderId;

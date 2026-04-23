@@ -78,7 +78,7 @@ git clone https://github.com/forrestcai/kb-bench
 cd kb-bench
 npm install
 cp .env.example .env
-# fill in at least ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY) for the agent
+# fill in ANTHROPIC_API_KEY for the agent
 # fill in OPENAI_API_KEY or OPENROUTER_API_KEY for the OpenAI-family judge
 # fill in GOOGLE_API_KEY, GEMINI_API_KEY, or FREE_GEMINI_API_KEY_1 for Gemini judging
 # fill in credentials for at least one platform
@@ -216,7 +216,7 @@ cost ([Verga et al., "Replacing Judges with Juries," 2024](https://arxiv.org/abs
 
 | Judge | Env var | Model |
 | --- | --- | --- |
-| Anthropic | `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` |
+| Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` |
 | OpenAI-family | `OPENAI_API_KEY` / `OPENROUTER_API_KEY` | `gpt-5.4` |
 | Google | `GOOGLE_API_KEY` / `GEMINI_API_KEY` / `FREE_GEMINI_API_KEY_N` | `gemini-3-pro` |
 

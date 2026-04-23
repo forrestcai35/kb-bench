@@ -44,7 +44,6 @@ function parseList(value: string | undefined): string[] {
 
 export interface Config {
   anthropicApiKey: string | undefined;
-  anthropicAuthToken: string | undefined;
   model: string;
   judgeModels: string[];
   excludeSameFamilyJudge: boolean;
@@ -115,8 +114,6 @@ export function getConfig(): Config {
 
   return {
     anthropicApiKey: optionalEnv("ANTHROPIC_API_KEY"),
-    anthropicAuthToken:
-      optionalEnv("ANTHROPIC_AUTH_TOKEN") ?? optionalEnv("CLAUDE_CODE_OAUTH_TOKEN"),
     model: optionalEnv("BENCH_MODEL") ?? "claude-sonnet-4-6",
     judgeModels: resolvedJudges,
     excludeSameFamilyJudge: (optionalEnv("BENCH_EXCLUDE_SAME_FAMILY_JUDGE") ?? "true") !== "false",
@@ -171,17 +168,8 @@ export function getConfig(): Config {
 }
 
 export function createAnthropicClient(config: Config): Anthropic {
-  if (config.anthropicAuthToken) {
-    return new Anthropic({
-      apiKey: null,
-      authToken: config.anthropicAuthToken,
-      defaultHeaders: { "anthropic-beta": "oauth-2025-04-20" },
-    });
+  if (!config.anthropicApiKey) {
+    throw new Error("Set ANTHROPIC_API_KEY to run the benchmark agent.");
   }
-  if (config.anthropicApiKey) {
-    return new Anthropic({ apiKey: config.anthropicApiKey });
-  }
-  throw new Error(
-    "Set ANTHROPIC_AUTH_TOKEN (OAuth — e.g. Claude Max subscription) or ANTHROPIC_API_KEY to run the benchmark agent. CLAUDE_CODE_OAUTH_TOKEN is also accepted.",
-  );
+  return new Anthropic({ apiKey: config.anthropicApiKey });
 }
