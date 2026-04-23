@@ -66,9 +66,9 @@ export interface Config {
 }
 
 const DEFAULT_JUDGE_PANEL = [
-  "claude-opus-4-7",
-  "gpt-4.1",
-  "gemini-2.5-pro",
+  "claude-sonnet-4-6",
+  "gpt-5.4",
+  "gemini-3-pro",
 ];
 
 export function getConfig(): Config {
@@ -85,7 +85,7 @@ export function getConfig(): Config {
     anthropicApiKey: optionalEnv("ANTHROPIC_API_KEY"),
     anthropicAuthToken:
       optionalEnv("ANTHROPIC_AUTH_TOKEN") ?? optionalEnv("CLAUDE_CODE_OAUTH_TOKEN"),
-    model: optionalEnv("BENCH_MODEL") ?? "claude-opus-4-7",
+    model: optionalEnv("BENCH_MODEL") ?? "claude-sonnet-4-6",
     judgeModels: resolvedJudges,
     excludeSameFamilyJudge: (optionalEnv("BENCH_EXCLUDE_SAME_FAMILY_JUDGE") ?? "true") !== "false",
     effort: (optionalEnv("BENCH_EFFORT") as Config["effort"] | undefined) ?? "high",
