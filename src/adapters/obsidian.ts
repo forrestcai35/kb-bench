@@ -1,21 +1,26 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Config } from "../config.js";
-import type { PlatformAdapter } from "./base.js";
+import { renderSystemPrompt, type PlatformAdapter, type ToolExecutionResult } from "./base.js";
+
+const TOOLS_DESCRIPTION = `- \`search\`(query, limit): full-text search across the knowledge base. Returns an array of matches with a document id (filename), title, and relevance snippet.
+- \`fetch\`(id): return the full content of a specific document by its id (filename).
+- \`list\`(limit): list all documents. Only use if search fails.`;
 
 export class ObsidianAdapter implements PlatformAdapter {
   readonly name = "obsidian";
-  readonly systemPrompt =
-    "You are querying an Obsidian vault via the Local REST API plugin. Use `search_vault` for full-text search across notes (returns filename, score, and match context). Use `get_note` to read a specific markdown note in full when the search context is insufficient. Use `list_vault` to browse files in a folder. Keep your answer grounded in what the tools return.";
+  readonly systemPrompt = renderSystemPrompt(TOOLS_DESCRIPTION);
   readonly available: boolean;
   readonly unavailableReason?: string;
 
   private readonly apiUrl: string;
   private readonly apiKey: string | undefined;
+  private readonly folder: string;
   private readonly allowInsecureTls: boolean;
 
   constructor(config: Config) {
     this.apiUrl = config.obsidian.apiUrl.replace(/\/$/, "");
     this.apiKey = config.obsidian.apiKey;
+    this.folder = config.obsidian.folder.replace(/^\/+|\/+$/g, "");
     this.allowInsecureTls = config.obsidian.insecureTls;
     if (!this.apiKey) {
       this.available = false;
@@ -27,94 +32,95 @@ export class ObsidianAdapter implements PlatformAdapter {
 
   readonly tools: Anthropic.Tool[] = [
     {
-      name: "search_vault",
-      description:
-        "Full-text search across all notes in the Obsidian vault. Returns an array of { filename, score, matches: [{ context, match }] }. Use `get_note` to read a full file once you've identified a relevant filename.",
+      name: "search",
+      description: "Full-text search across the knowledge base. Returns an array of matches with id (path), title, and relevance snippet.",
       input_schema: {
         type: "object",
         properties: {
           query: { type: "string", description: "The search query" },
-          context_length: {
-            type: "number",
-            description: "Characters of context around each match (default 100)",
-            default: 100,
-          },
+          limit: { type: "number", description: "Max results (default 5)", default: 5 },
         },
         required: ["query"],
       },
     },
     {
-      name: "get_note",
-      description:
-        "Read the full markdown content of a note by its vault-relative path (including .md extension), e.g. \"Benchmarks/Deploying the Web App.md\".",
+      name: "fetch",
+      description: "Return the full content of a specific document by its id (vault-relative path including .md).",
       input_schema: {
         type: "object",
         properties: {
-          path: {
-            type: "string",
-            description: "Vault-relative path to the markdown file, including the .md extension.",
-          },
+          id: { type: "string", description: "Vault-relative path to the markdown file, including the .md extension." },
         },
-        required: ["path"],
+        required: ["id"],
       },
     },
     {
-      name: "list_vault",
-      description:
-        "List the files and subfolders at a given vault-relative folder path. Pass an empty string to list the vault root. Returns { files: string[] } where directory entries end with a trailing slash.",
+      name: "list",
+      description: "List all documents. Only use when search fails to surface likely candidates.",
       input_schema: {
         type: "object",
         properties: {
-          path: {
-            type: "string",
-            description: "Vault-relative folder path. Empty string (or omitted) for the root.",
-            default: "",
-          },
+          limit: { type: "number", description: "Max documents to return (default 50)", default: 50 },
         },
       },
     },
   ];
 
-  async execute(toolName: string, toolInput: Record<string, unknown>): Promise<string> {
-    if (!this.available) throw new Error(this.unavailableReason ?? "Obsidian adapter unavailable");
+  async execute(toolName: string, toolInput: Record<string, unknown>): Promise<ToolExecutionResult> {
+    if (!this.available) throw new Error(this.unavailableReason ?? "Adapter unavailable");
     switch (toolName) {
-      case "search_vault":
+      case "search":
         return this.searchVault(toolInput);
-      case "get_note":
+      case "fetch":
         return this.getNote(toolInput);
-      case "list_vault":
+      case "list":
         return this.listVault(toolInput);
       default:
-        throw new Error(`Unknown Obsidian tool: ${toolName}`);
+        throw new Error(`Unknown tool: ${toolName}`);
     }
   }
 
-  private async searchVault(args: Record<string, unknown>): Promise<string> {
+  private async searchVault(args: Record<string, unknown>): Promise<ToolExecutionResult> {
     const query = String(args.query ?? "");
-    const contextLength = Number(args.context_length ?? 100);
-    const params = new URLSearchParams({
-      query,
-      contextLength: String(contextLength),
-    });
-    return this.request(`/search/simple/?${params.toString()}`, {
+    const limit = Number(args.limit ?? 5);
+    const params = new URLSearchParams({ query, contextLength: "160" });
+    const raw = await this.request(`/search/simple/?${params.toString()}`, {
       method: "POST",
       accept: "application/json",
     });
+    try {
+      const parsed = JSON.parse(raw) as Array<{ filename?: string }>;
+      const trimmed = parsed.slice(0, limit);
+      const ids = trimmed.map((r) => r.filename ?? "").filter(Boolean);
+      return { text: JSON.stringify(trimmed, null, 2), retrievedDocIds: ids };
+    } catch {
+      return { text: raw, retrievedDocIds: [] };
+    }
   }
 
-  private async getNote(args: Record<string, unknown>): Promise<string> {
-    const path = String(args.path ?? "");
-    if (!path) throw new Error("Missing path");
-    return this.request(`/vault/${encodeVaultPath(path)}`, {
+  private async getNote(args: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const id = String(args.id ?? "");
+    if (!id) throw new Error("Missing id");
+    const text = await this.request(`/vault/${encodeVaultPath(id)}`, {
       method: "GET",
       accept: "text/markdown",
     });
+    return { text, retrievedDocIds: [id] };
   }
 
-  private async listVault(args: Record<string, unknown>): Promise<string> {
-    const path = String(args.path ?? "");
-    const endpoint = path ? `/vault/${encodeVaultPath(path)}/` : "/vault/";
-    return this.request(endpoint, { method: "GET", accept: "application/json" });
+  private async listVault(args: Record<string, unknown>): Promise<ToolExecutionResult> {
+    const limit = Number(args.limit ?? 50);
+    const endpoint = this.folder ? `/vault/${encodeVaultPath(this.folder)}/` : "/vault/";
+    const raw = await this.request(endpoint, { method: "GET", accept: "application/json" });
+    try {
+      const parsed = JSON.parse(raw) as { files?: string[] };
+      const trimmed = (parsed.files ?? []).slice(0, limit);
+      const prefix = this.folder ? `${this.folder}/` : "";
+      const ids = trimmed.filter((f) => !f.endsWith("/")).map((f) => `${prefix}${f}`);
+      return { text: JSON.stringify({ files: trimmed }, null, 2), retrievedDocIds: ids };
+    } catch {
+      return { text: raw, retrievedDocIds: [] };
+    }
   }
 
   private async request(
@@ -142,7 +148,7 @@ export class ObsidianAdapter implements PlatformAdapter {
           const body = await response.text();
           if (body) message = body;
         } catch {}
-        throw new Error(`Obsidian API error (${response.status}): ${message}`);
+        throw new Error(`API error (${response.status}): ${message}`);
       }
       return await response.text();
     } finally {

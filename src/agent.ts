@@ -1,7 +1,10 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { createAnthropicClient, type Config } from "./config.js";
 import type { PlatformAdapter } from "./adapters/base.js";
-import type { BenchmarkQuery, QueryMetrics, ToolCallMetric } from "./types.js";
+import { computeRetrievalMetrics } from "./retrieval.js";
+import { computeCost, pricingForModel } from "./pricing.js";
+import { withRetry } from "./retry.js";
+import type { BenchmarkQuery, ErrorType, QueryMetrics, ToolCallMetric } from "./types.js";
 
 export class BenchmarkAgent {
   private readonly client: Anthropic;
@@ -9,6 +12,7 @@ export class BenchmarkAgent {
   private readonly effort: Config["effort"];
   private readonly maxTokens: number;
   private readonly maxTurns: number;
+  private readonly retries: number;
 
   constructor(config: Config) {
     this.client = createAnthropicClient(config);
@@ -16,12 +20,15 @@ export class BenchmarkAgent {
     this.effort = config.effort;
     this.maxTokens = config.maxTokens;
     this.maxTurns = config.maxTurns;
+    this.retries = config.retries;
   }
 
-  async runQuery(adapter: PlatformAdapter, query: BenchmarkQuery): Promise<QueryMetrics> {
+  async runQuery(adapter: PlatformAdapter, query: BenchmarkQuery, run: number): Promise<QueryMetrics> {
+    const pricing = pricingForModel(this.model);
     const metrics: QueryMetrics = {
       platform: adapter.name,
       queryId: query.id,
+      run,
       question: query.question,
       answer: "",
       totalInputTokens: 0,
@@ -31,8 +38,18 @@ export class BenchmarkAgent {
       toolCallCount: 0,
       turns: 0,
       toolCalls: [],
+      retrieval: {
+        retrievedDocs: [],
+        firstRelevantRank: null,
+        recall: 0,
+        precision: 0,
+        reciprocalRank: 0,
+        ndcg: 0,
+      },
+      cost: { inputUsd: 0, outputUsd: 0, totalUsd: 0 },
     };
 
+    const retrievalOrder: string[] = [];
     const conversation: Anthropic.MessageParam[] = [
       { role: "user", content: query.question },
     ];
@@ -43,16 +60,22 @@ export class BenchmarkAgent {
         metrics.turns = turn + 1;
         const callStart = Date.now();
 
-        const stream = this.client.messages.stream({
-          model: this.model,
-          max_tokens: this.maxTokens,
-          system: adapter.systemPrompt,
-          tools: adapter.tools,
-          messages: conversation,
-          thinking: { type: "adaptive" },
-          output_config: { effort: this.effort },
-        });
-        const response = await stream.finalMessage();
+        const response = await withRetry(
+          `${adapter.name} ${query.id} turn ${turn + 1}`,
+          async () => {
+            const stream = this.client.messages.stream({
+              model: this.model,
+              max_tokens: this.maxTokens,
+              system: adapter.systemPrompt,
+              tools: adapter.tools,
+              messages: conversation,
+              thinking: { type: "adaptive" },
+              output_config: { effort: this.effort },
+            });
+            return stream.finalMessage();
+          },
+          { retries: this.retries },
+        );
 
         metrics.totalInputTokens += response.usage.input_tokens;
         metrics.totalOutputTokens += response.usage.output_tokens;
@@ -63,6 +86,7 @@ export class BenchmarkAgent {
           outputTokens: response.usage.output_tokens,
           toolResultTokens: 0,
           durationMs: Date.now() - callStart,
+          retrievedDocIds: [],
         };
 
         conversation.push({ role: "assistant", content: response.content });
@@ -88,10 +112,17 @@ export class BenchmarkAgent {
           metrics.toolCallCount += 1;
           const toolStart = Date.now();
           let resultText: string;
+          let retrievedIds: string[] = [];
           let isError = false;
           try {
             const toolInput = (toolUse.input ?? {}) as Record<string, unknown>;
-            resultText = await adapter.execute(toolUse.name, toolInput);
+            const result = await withRetry(
+              `${adapter.name} ${toolUse.name}`,
+              () => adapter.execute(toolUse.name, toolInput),
+              { retries: this.retries },
+            );
+            resultText = result.text;
+            retrievedIds = result.retrievedDocIds ?? [];
           } catch (error) {
             isError = true;
             resultText = `Error: ${(error as Error).message}`;
@@ -99,6 +130,7 @@ export class BenchmarkAgent {
 
           const resultTokens = await this.countTokens(resultText);
           metrics.toolResultTokens += resultTokens;
+          for (const id of retrievedIds) retrievalOrder.push(id);
 
           metrics.toolCalls.push({
             name: toolUse.name,
@@ -106,6 +138,7 @@ export class BenchmarkAgent {
             outputTokens: 0,
             toolResultTokens: resultTokens,
             durationMs: Date.now() - toolStart,
+            retrievedDocIds: retrievedIds,
           });
 
           toolResults.push({
@@ -122,17 +155,15 @@ export class BenchmarkAgent {
 
       if (!metrics.answer) {
         metrics.error = `No final answer after ${this.maxTurns} turns`;
+        metrics.errorType = "no_answer";
       }
     } catch (error) {
-      if (error instanceof Anthropic.RateLimitError) {
-        metrics.error = `RateLimitError: ${error.message}`;
-      } else if (error instanceof Anthropic.APIError) {
-        metrics.error = `APIError ${error.status}: ${error.message}`;
-      } else {
-        metrics.error = (error as Error).message;
-      }
+      metrics.error = errorMessage(error);
+      metrics.errorType = classifyError(error);
     }
     metrics.totalLatencyMs = Date.now() - runStart;
+    metrics.retrieval = computeRetrievalMetrics(retrievalOrder, query.relevantDocs);
+    metrics.cost = computeCost(metrics.totalInputTokens, metrics.totalOutputTokens, pricing);
     return metrics;
   }
 
@@ -145,6 +176,7 @@ export class BenchmarkAgent {
   }
 
   private async countTokens(text: string): Promise<number> {
+    if (!text) return 0;
     try {
       const res = await this.client.messages.countTokens({
         model: this.model,
@@ -155,4 +187,19 @@ export class BenchmarkAgent {
       return Math.ceil(text.length / 4);
     }
   }
+}
+
+function classifyError(error: unknown): ErrorType {
+  if (error instanceof Anthropic.RateLimitError) return "rate_limit";
+  if (error instanceof Anthropic.APIError) return "api_error";
+  const msg = (error as Error | undefined)?.message?.toLowerCase() ?? "";
+  if (msg.includes("timeout") || msg.includes("etimedout")) return "timeout";
+  if (msg.includes("tool") || msg.includes("adapter")) return "tool_error";
+  return "unknown";
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Anthropic.RateLimitError) return `RateLimitError: ${error.message}`;
+  if (error instanceof Anthropic.APIError) return `APIError ${error.status}: ${error.message}`;
+  return (error as Error).message ?? String(error);
 }

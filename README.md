@@ -1,103 +1,133 @@
-# Knowledge Base Benchmark Harness
+# kb-bench
 
-Measures how efficiently an LLM agent can answer operational questions against **Lore**, **Notion**, **Confluence**, and **Obsidian** using each platform's standard agent-facing tools.
+**An open benchmark for agentic knowledge-base retrieval.**
 
-The benchmark runs a manual Claude Opus 4.7 agentic loop over a fixed corpus of 20 ops runbooks and records, per platform and per query:
+`kb-bench` drives a single LLM agent against a shared, fictional operational
+corpus, swapping only the *knowledge base the agent queries* between runs, and
+records what it takes the agent to correctly answer the same 20 questions from
+each one.
 
-- Total input tokens consumed by the agent
-- Total output tokens produced
-- **Tool-result tokens** — how much raw platform payload the agent was forced to read
-- Wall-clock latency
-- Number of tool calls / turns
-- Final answer (scored 0–5 by an LLM judge)
+For every (platform, query, run) triple it records:
 
-The primary thesis this harness validates is:
+- **Correctness** — a judge score 0–5 from an LLM judge that is blinded to
+  which platform produced the answer.
+- **Retrieval quality** — recall, precision, MRR, and nDCG against annotated
+  gold documents. The agent's tool calls are inspected, not its prose.
+- **Cost** — input tokens, output tokens, and **tool-result tokens** (how much
+  raw payload the platform forced the agent to read), mapped to USD via a
+  pricing table.
+- **Work** — wall-clock latency, tool-call count, agentic turns.
+- **Failure modes** — categorized error types (rate limit, API, tool, timeout,
+  no-answer, unknown).
 
-> An agent querying Lore reads materially fewer tokens and finishes faster than the same agent querying Notion, Confluence, or Obsidian for the same question with the same corpus.
+There is no privileged platform. The reference runbook set is a made-up SaaS
+company called "Acme". Every adapter must implement the same three tools
+(`search`, `fetch`, `list`) and is driven by the same system-prompt template.
+Relative comparisons (one platform as a denominator) are opt-in via
+`--baseline <platform>`.
 
-## Why this design
+## Design principles
 
-- **Identical corpus across platforms.** `corpus/sample-runbooks.md` is the source of truth. Each platform is seeded with the same runbooks so the only variable is the retrieval interface.
-- **Single agent loop, swappable adapters.** The agent is one Claude Opus 4.7 loop; each `PlatformAdapter` exposes the tools that platform natively offers an agent (Lore's semantic-chunk `search_knowledge_base`, Notion's page-level `search_pages` + `get_page_content`, etc.). Differences in measured tokens and latency come from the tools, not the model.
-- **Manual loop, not SDK tool runner.** We need per-tool-call token visibility — the high-level tool runner hides it.
-- **No prompt caching.** `cache_control` is not set anywhere. Cache hits would skew comparative measurements across platforms.
-- **LLM judge uses the same model.** The judge scores 0–5 on correctness. It does not see which platform produced the answer.
+The benchmark is useful only to the extent that it is *fair*. These are the
+invariants — if you find one being violated, please open an issue.
 
-## Setup
+1. **Identical corpus across platforms.** `data/corpus/` is canonical. The
+   `seed` script pushes the same documents to every platform; the corpus
+   hash is embedded in every result file.
+2. **Identical system prompt.** All adapters produce their system prompt from
+   `renderSystemPrompt(toolsDescription)` in `src/adapters/base.ts`. Only the
+   tool signature lines differ.
+3. **Identical tool contract.** Every adapter exposes exactly `search`,
+   `fetch`, and `list` with matching parameter schemas. Tool descriptions are
+   structurally the same.
+4. **Blind judge.** The judge never sees which platform produced an answer.
+   The candidate answer is additionally scrubbed for platform names
+   (`Notion`, `Obsidian`, etc.) before scoring.
+5. **No prompt caching.** `cache_control` is deliberately unset; cache hits
+   would skew comparative measurements.
+6. **Deterministic-ish but measured.** Pass `--runs N` to average across N
+   runs; the report renders 95% confidence intervals whenever N ≥ 2.
+7. **Reproducibility metadata.** The corpus hash, query hash, model, SDK
+   version, node version, and benchmark version are recorded in every run.
+   Any two runs with matching hashes used the same inputs.
 
-### 1. Install
+## Supported platforms
+
+| Platform | Tools exposed | Notes |
+| --- | --- | --- |
+| Lore | `search`, `fetch`, `list` | REST API with PAT auth. Reference adapter. |
+| Notion | `search`, `fetch`, `list` | Uses the Notion SDK (`pages.create`, `search`, `blocks.children.list`). |
+| Confluence | `search`, `fetch`, `list` | CQL search, v2 pages API. |
+| Obsidian | `search`, `fetch`, `list` | Local REST API plugin, loopback only. |
+
+Adding a new platform is a single adapter file — see
+[CONTRIBUTING.md](./CONTRIBUTING.md).
+
+## Quickstart
 
 ```bash
-cd benchmarks
+git clone https://github.com/forrestcai/kb-bench
+cd kb-bench
 npm install
+cp .env.example .env
+# fill in at least ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY)
+# + credentials for at least one platform
+npm run seed -- --platform notion         # once per platform
+npm run bench -- --runs 3                 # all platforms, 3 runs each
 ```
 
-### 2. Environment variables
+Results land in `results/bench-<timestamp>.json` (raw) and
+`results/bench-<timestamp>.md` (formatted).
 
-Required — provide **one** of these so the agent and judge can call Claude:
+## Dataset
+
+The dataset lives in `data/`:
+
+```
+data/
+├── corpus/
+│   ├── INDEX.md              # human-readable table of contents
+│   ├── corpus.jsonl          # {id, title, body} per line — canonical form
+│   └── doc-*.md              # same corpus, one markdown file per doc
+└── queries/
+    └── queries.jsonl         # {id, question, goldAnswer, relevantDocs, ...}
+```
+
+**20 documents, 20 queries.** Each query is annotated with the document id(s)
+that contain the answer — this is what makes retrieval metrics possible
+without running an independent retriever.
+
+**Split.** Today all 20 queries are in the `public` split. A `holdout` split
+is reserved for future private evaluation (we will not commit it to the repo).
+Pass `--split holdout` or `--split all` if you have extended the dataset.
+
+**Corpus content.** Every runbook is a fictional operational document for a
+made-up SaaS company called "Acme". No real companies, people, or internal
+URLs are referenced. The corpus is MIT-licensed along with the code.
+
+## CLI
 
 ```bash
-# Preferred if you have Claude Max — folds benchmark spend into your
-# subscription instead of burning pay-per-token API credits.
-export ANTHROPIC_AUTH_TOKEN=<oauth_token>       # or CLAUDE_CODE_OAUTH_TOKEN
-# Fallback: regular API key.
-export ANTHROPIC_API_KEY=sk-ant-...
+# All platforms available, all queries, 1 run each (default)
+npm run bench
+
+# Subset of platforms + queries
+npm run bench -- --platforms lore,notion --queries q01-deploy-web,q05-workspace-scoping
+
+# Multi-run with a baseline in the report
+npm run bench -- --runs 5 --baseline notion
+
+# Public split (default) vs private holdout set
+npm run bench -- --split public
+npm run bench -- --split holdout
+
+# Re-render a report from an existing json
+npm run report -- results/bench-....json --baseline lore
 ```
 
-If both are set, the OAuth token wins. OAuth requests are sent with
-`anthropic-beta: oauth-2025-04-20` automatically.
+Every platform missing credentials is auto-skipped with a `[skip]` message.
 
-Per platform (only set the ones you want to benchmark):
-
-```bash
-# Lore (bench/judge — PAT path)
-export LORE_API_URL=https://lightfield.app            # default
-export LORE_API_KEY=lore_pat_...
-export LORE_WORKSPACE_ID=<workspace_uuid>             # scope queries to a dedicated workspace
-
-# Lore (seed only — direct Supabase insert, same pattern as apps/blog-writer)
-export SUPABASE_URL=https://<project>.supabase.co
-export SUPABASE_SERVICE_ROLE_KEY=<service_role_key>
-export LORE_USER_ID=<user_uuid>                        # author of the seeded documents
-export LORE_BENCHMARK_FOLDER_NAME=Benchmarks           # optional; folder is created if missing
-export LORE_AUTHOR="Benchmark Seed"                    # optional; display author on rows
-export LORE_CLI_API_KEY=<cli_key>                      # POST /api/admin/backfill-sections to index seeded docs; falls back to LORE_API_KEY
-
-# Notion
-export NOTION_TOKEN=secret_...
-export NOTION_PARENT_PAGE_ID=<parent_page_id>         # parent page the seed script creates runbooks under
-
-# Confluence
-export CONFLUENCE_BASE_URL=https://<site>.atlassian.net
-export CONFLUENCE_EMAIL=<atlassian_account_email>
-export CONFLUENCE_API_TOKEN=<api_token>               # id.atlassian.com → Security → API tokens
-export CONFLUENCE_SPACE_KEY=<SPACEKEY>                # the KEY from /wiki/spaces/<KEY>/..., not the name
-export CONFLUENCE_PARENT_PAGE_ID=<page_id>            # optional; nest seeded runbooks under this page
-
-# Obsidian (via the Local REST API community plugin — https://github.com/coddingtonbear/obsidian-local-rest-api)
-# Install the plugin, open its settings, and EITHER enable "Enable Non-encrypted (HTTP) Server"
-# (recommended for benchmarking — port 27123) OR keep the default HTTPS on 27124 and set
-# OBSIDIAN_INSECURE_TLS=true below to trust the self-signed cert.
-export OBSIDIAN_API_URL=http://127.0.0.1:27123        # default; use https://127.0.0.1:27124 for the default HTTPS server
-export OBSIDIAN_API_KEY=<api_key_from_plugin_settings>
-export OBSIDIAN_VAULT_FOLDER=Benchmarks               # optional; vault-relative folder seeded runbooks go under
-export OBSIDIAN_INSECURE_TLS=true                     # optional; only required when OBSIDIAN_API_URL is https:// with a self-signed cert
-```
-
-Optional tuning:
-
-```bash
-export BENCH_MODEL=claude-opus-4-7           # default
-export BENCH_EFFORT=high                     # low|medium|high|xhigh|max
-export BENCH_MAX_TOKENS=16000                # per-call max_tokens
-export BENCH_MAX_TURNS=10                    # stop runaway loops
-```
-
-Platforms missing credentials are auto-skipped.
-
-### 3. Seed each platform
-
-Instead of copy-pasting by hand, the seed script reads `corpus/sample-runbooks.md`, splits on `---`, and pushes each section to the target platform via its write API:
+### Seeding
 
 ```bash
 npm run seed -- --platform lore
@@ -106,64 +136,132 @@ npm run seed -- --platform confluence
 npm run seed -- --platform obsidian
 ```
 
-Per-platform notes:
-
-- **Lore** inserts rows directly into the `documents` table via the Supabase service role (same mechanism as `apps/blog-writer`). Each section becomes one document in the `LORE_BENCHMARK_FOLDER_NAME` folder, authored by `LORE_USER_ID`. This bypasses the ingest API's dedup + PAT-auth entirely — appropriate because the benchmark harness is internal tooling, not a product surface. After the inserts finish, the script calls `POST /api/admin/backfill-sections` (bearer = `LORE_CLI_API_KEY`, falls back to `LORE_API_KEY`) on the configured `LORE_API_URL` to populate `document_section` / `document_section_chunk`. The server does the embedding via Gemini `gemini-embedding-001`, rotating through `FREE_GEMINI_API_KEY_*` env vars on quota errors.
-- **Notion** calls `pages.create` under `NOTION_PARENT_PAGE_ID`. The integration token must have that parent page shared with it. Markdown is converted to Notion blocks (headings, bullets, numbered lists, paragraphs).
-- **Confluence** resolves `CONFLUENCE_SPACE_KEY` → numeric `spaceId` via v2 API, then `POST /wiki/api/v2/pages` per runbook with markdown converted to Confluence storage-format XHTML (headings, bulleted/numbered lists, paragraphs, inline `<strong>` and `<code>`). Auth is basic (email + API token). No storage-quota gotchas. If `CONFLUENCE_PARENT_PAGE_ID` is set, pages nest under it; otherwise they land at the space root.
-- **Obsidian** requires the vault to be open in the desktop app with the Local REST API plugin running. Seed `PUT`s each section as `<OBSIDIAN_VAULT_FOLDER>/<title>.md` via `PUT /vault/<path>` — Obsidian picks up the new files on the fly (no reindex step). Because the plugin listens on localhost only, the benchmark must be run from the same machine as Obsidian. The vault's built-in search powers `search_vault` at query time; there is no separate indexing call.
-
-Use fresh, dedicated surfaces on each platform (new workspace / parent page / vault folder) so unrelated content doesn't contaminate search results.
-
-## Run
-
-All platforms, all queries:
-
-```bash
-npm run bench
-```
-
-A subset:
-
-```bash
-npm run bench -- --platforms lore,notion,obsidian --queries q01-deploy-web,q05-workspace-scoping
-```
-
-Custom output directory:
-
-```bash
-npm run bench -- --out results/2026-04-20-run1
-```
-
-Results land in `results/bench-<timestamp>.json` (raw) and `results/bench-<timestamp>.md` (formatted).
+Use fresh, dedicated surfaces on each platform (a new workspace / parent page /
+vault folder) so unrelated content doesn't contaminate search results.
 
 ## Interpreting the report
 
-The markdown report has:
+The generated markdown has four sections:
 
-1. **Platform summary** — averaged metrics per platform.
-2. **Ratios vs Lore** — how much more (or less) each competitor consumes vs Lore on the same queries.
-3. **Per-query breakdown** — one table per query showing how each platform performed on that specific question.
+### 1. Platform summary
 
-Tool-result tokens is usually the most discriminating metric: it's the raw payload each platform dumps into the model's context before the model reasons about it.
+Mean values across runs with 95% confidence intervals. Columns:
 
-## Adding a new platform
+- `Score` — judge 0–5 (mean of N runs × 20 queries).
+- `Recall`, `MRR`, `nDCG` — retrieval quality of the tool calls the agent
+  made, vs the documents labelled relevant for each question.
+- `Input tokens`, `Output tokens`, `Tool-result tokens` — LLM input, LLM
+  output, and raw tool payload read by the model.
+- `Latency` — wall-clock per query.
+- `Tool calls`, `Turns` — count of tool invocations and agentic turns.
+- `Cost` — mapped to USD via `src/pricing.ts`. Edit that file to reflect your
+  own contract / subscription.
+- `Errors` — count of runs that failed.
 
-1. Implement `PlatformAdapter` in `src/adapters/<platform>.ts`.
-2. Register it in `src/index.ts`.
-3. Extend the README's env var section.
-4. If the platform needs seeding, add a `seedX()` branch in `scripts/seed.ts`.
+### 2. Relative comparison
 
-Rules of thumb:
+Only rendered when `--baseline <platform>` is set. Values > 1.0 mean the
+other platform consumes more of that metric than the baseline; < 1.0 means
+less. `kb-bench` does not choose a baseline for you — there is no "winner" by
+default.
 
-- The `tools` array should mirror what a realistic agent sees when calling that platform (the MCP server, official API wrappers, or similar).
-- `execute(toolName, input)` returns the raw string the LLM will see as `tool_result`. Do **not** summarize or strip content — that defeats the benchmark.
-- If the platform's API requires pagination to fetch full content, honor that in the adapter. The point is to measure _realistic_ agent usage.
+### 3. Error breakdown
 
-## Caveats
+Per-platform counts by error type. Only rendered if any run errored.
 
-- **Corpus size.** 20 runbooks is small. Differences widen with bigger corpora because Notion/Docs responses grow with doc count more than Lore's chunked retrieval does.
-- **Network latency.** Add `--runs N` averaging once latency numbers stabilize across warm runs (currently a single run per query per platform).
-- **Judge variance.** The LLM judge is deterministic-ish but not perfect. Spot-check low scores before drawing strong conclusions.
-- **No rate-limit handling.** Long runs may hit platform rate limits; add backoff if needed.
-- **Obsidian runs locally.** The Local REST API plugin binds to loopback only, so the harness must run on the same machine as Obsidian — network latency on that hop is effectively zero and will bias latency-based comparisons in Obsidian's favor. Token-count comparisons are unaffected.
+### 4. Per-query breakdown
+
+One table per query. Useful for spot-checking: low scores are often judge
+quirks rather than genuine failures.
+
+## Methodology
+
+### Agent loop
+
+The agent is a manual loop in `src/agent.ts`:
+
+1. Send the question + system prompt + tool definitions to Claude.
+2. If the model returns `tool_use`, invoke the tool on the adapter, count the
+   raw result tokens, record the retrieved document ids, append the tool
+   result, and loop.
+3. Stop on `end_turn`, `stop_sequence`, or after `BENCH_MAX_TURNS` (default
+   10) turns.
+4. If the model never emits a final answer, the run is recorded with
+   `errorType: "no_answer"`.
+
+All API and tool calls are retried with exponential backoff (with a hint from
+`Retry-After`) on rate limits, connection errors, and 5xx. `BENCH_RETRIES`
+controls the count.
+
+### Judge
+
+The judge is the same model by default (configurable via `BENCH_JUDGE_MODEL`).
+It sees:
+
+- The question
+- The reference answer from `queries.jsonl`
+- The candidate answer (with platform names scrubbed to `[KB]`)
+
+It does not see which platform produced the candidate. It scores 0–5 on
+factual correctness only.
+
+### Retrieval metrics
+
+Every adapter is required to return a set of document ids with every tool
+result (`ToolExecutionResult.retrievedDocIds`). The benchmark collects those
+ids in call order, deduplicates, and computes:
+
+- **Recall** — fraction of `relevantDocs` the agent's tools surfaced.
+- **Precision** — fraction of retrieved docs that are relevant.
+- **MRR** — reciprocal rank of the first relevant doc in the dedup'd list.
+- **nDCG** — discounted-cumulative-gain normalization with binary relevance.
+
+These are orthogonal to the judge score: a platform can retrieve the correct
+document but the model can still answer incorrectly (or vice versa).
+
+### Cost
+
+Token counts are mapped to USD using `src/pricing.ts`. The defaults reflect
+list prices as of 2026-04. If you run on a different contract, edit the
+pricing table; the benchmark does not hardcode any discount.
+
+## Known limitations
+
+- **Corpus size.** 20 documents is small. Platforms whose response size scales
+  with corpus size (Notion, Confluence) may look better than they would on
+  an enterprise-scale corpus.
+- **Judge variance.** An LLM judge is not a human evaluator. Low scores are
+  often judge quirks. Use `--runs N ≥ 3` and spot-check.
+- **Single model family.** Current adapters and the agent loop use the
+  Anthropic SDK. Porting the agent loop to OpenAI / Gemini is in scope —
+  contributions welcome.
+- **Obsidian is loopback-only.** The Local REST API plugin binds to
+  127.0.0.1, so `kb-bench` must run on the same machine as Obsidian. Latency
+  comparisons involving Obsidian are biased in its favor (near-zero network
+  RTT); token comparisons are not affected.
+- **Seeding is not idempotent.** Running `seed` twice creates duplicates.
+  Seed into a fresh, dedicated workspace / parent page / vault folder.
+- **Confluence storage format is verbose.** Confluence returns XHTML storage
+  format; Notion returns JSON blocks. Token counts include that overhead,
+  which is the intended "realistic agent experience" measurement.
+
+## Contributing
+
+New adapters, expanded corpora, alternative judges, and additional agent
+frameworks are all welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md).
+
+## Citation
+
+If you use this benchmark, please cite:
+
+```bibtex
+@software{kb_bench_2026,
+  title = {kb-bench: An open benchmark for agentic knowledge-base retrieval},
+  year  = {2026},
+  url   = {https://github.com/forrestcai/kb-bench}
+}
+```
+
+## License
+
+MIT. See [LICENSE](./LICENSE).

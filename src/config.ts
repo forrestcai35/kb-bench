@@ -12,9 +12,13 @@ export interface Config {
   anthropicApiKey: string | undefined;
   anthropicAuthToken: string | undefined;
   model: string;
+  judgeModel: string;
   effort: "low" | "medium" | "high" | "xhigh" | "max";
   maxTokens: number;
   maxTurns: number;
+  retries: number;
+  runsPerQuery: number;
+  topK: number;
   lore: {
     apiUrl: string;
     apiKey: string | undefined;
@@ -29,7 +33,7 @@ export interface Config {
   };
   notion: {
     token: string | undefined;
-    databaseId: string | undefined;
+    parentPageId: string | undefined;
   };
   confluence: {
     baseUrl: string | undefined;
@@ -52,9 +56,13 @@ export function getConfig(): Config {
     anthropicAuthToken:
       optionalEnv("ANTHROPIC_AUTH_TOKEN") ?? optionalEnv("CLAUDE_CODE_OAUTH_TOKEN"),
     model: optionalEnv("BENCH_MODEL") ?? "claude-opus-4-7",
+    judgeModel: optionalEnv("BENCH_JUDGE_MODEL") ?? optionalEnv("BENCH_MODEL") ?? "claude-opus-4-7",
     effort: (optionalEnv("BENCH_EFFORT") as Config["effort"] | undefined) ?? "high",
     maxTokens: Number(optionalEnv("BENCH_MAX_TOKENS") ?? "16000"),
     maxTurns: Number(optionalEnv("BENCH_MAX_TURNS") ?? "10"),
+    retries: Number(optionalEnv("BENCH_RETRIES") ?? "3"),
+    runsPerQuery: Number(optionalEnv("BENCH_RUNS") ?? "1"),
+    topK: Number(optionalEnv("BENCH_TOP_K") ?? "5"),
     lore: {
       apiUrl: optionalEnv("LORE_API_URL") ?? "https://lightfield.app",
       apiKey: optionalEnv("LORE_API_KEY"),
@@ -65,11 +73,11 @@ export function getConfig(): Config {
       workspaceId: optionalEnv("LORE_WORKSPACE_ID"),
       userId: optionalEnv("LORE_USER_ID"),
       folderName: optionalEnv("LORE_BENCHMARK_FOLDER_NAME") ?? "Benchmarks",
-      author: optionalEnv("LORE_AUTHOR") ?? "Benchmark Seed",
+      author: optionalEnv("LORE_AUTHOR") ?? "kb-bench",
     },
     notion: {
       token: optionalEnv("NOTION_TOKEN"),
-      databaseId: optionalEnv("NOTION_DATABASE_ID"),
+      parentPageId: optionalEnv("NOTION_PARENT_PAGE_ID"),
     },
     confluence: {
       baseUrl: optionalEnv("CONFLUENCE_BASE_URL"),

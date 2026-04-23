@@ -1,11 +1,14 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Config } from "../config.js";
-import type { PlatformAdapter } from "./base.js";
+import { renderSystemPrompt, type PlatformAdapter, type ToolExecutionResult } from "./base.js";
+
+const TOOLS_DESCRIPTION = `- \`search\`(query, limit): semantic search across the corpus. Returns an array of matches, each with a document id, a title, and a relevance snippet.
+- \`fetch\`(id): return the full content of a specific document by its id.
+- \`list\`(limit, offset): list documents. Only use if search fails.`;
 
 export class LoreAdapter implements PlatformAdapter {
   readonly name = "lore";
-  readonly systemPrompt =
-    "You are querying the Lore operational knowledge base. Use `search_knowledge_base` for semantic search over the corpus. Use `get_document` to read a specific document in full when a search snippet is insufficient. Use `list_documents` only when browsing recent content. Keep your answer grounded in what the tools return.";
+  readonly systemPrompt = renderSystemPrompt(TOOLS_DESCRIPTION);
   readonly available: boolean;
   readonly unavailableReason?: string;
 
@@ -27,77 +30,82 @@ export class LoreAdapter implements PlatformAdapter {
 
   readonly tools: Anthropic.Tool[] = [
     {
-      name: "search_knowledge_base",
-      description: "Search the Lore knowledge base using semantic search. Returns pre-formatted chunks with breadcrumb-style headings, scoped to the user's workspace.",
+      name: "search",
+      description: "Semantic search across the corpus. Returns an array of matches with a document id, title, and relevance snippet.",
       input_schema: {
         type: "object",
         properties: {
-          query: { type: "string", description: "The search query formulation" },
-          limit: { type: "number", description: "Maximum number of results to return (default: 5)", default: 5 },
+          query: { type: "string", description: "The search query" },
+          limit: { type: "number", description: "Max number of results (default 5)", default: 5 },
         },
         required: ["query"],
       },
     },
     {
-      name: "get_document",
-      description: "Get full details and content of a specific Lore document by ID.",
+      name: "fetch",
+      description: "Return the full content of a specific document by its id.",
       input_schema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "The document ID to fetch" },
+          id: { type: "string", description: "The document id" },
         },
         required: ["id"],
       },
     },
     {
-      name: "list_documents",
-      description: "List recent documents in the Lore knowledge base.",
+      name: "list",
+      description: "List documents (paginated). Only use when search fails to surface likely candidates.",
       input_schema: {
         type: "object",
         properties: {
-          limit: { type: "number", description: "Maximum number of documents to list (default: 50)", default: 50 },
-          offset: { type: "number", description: "Pagination offset (default: 0)", default: 0 },
+          limit: { type: "number", description: "Max documents to return (default 50)", default: 50 },
+          offset: { type: "number", description: "Pagination offset (default 0)", default: 0 },
         },
       },
     },
   ];
 
-  async execute(toolName: string, toolInput: Record<string, unknown>): Promise<string> {
+  async execute(toolName: string, toolInput: Record<string, unknown>): Promise<ToolExecutionResult> {
     switch (toolName) {
-      case "search_knowledge_base":
+      case "search":
         return this.searchKnowledgeBase(toolInput);
-      case "get_document":
+      case "fetch":
         return this.getDocument(toolInput);
-      case "list_documents":
+      case "list":
         return this.listDocuments(toolInput);
       default:
-        throw new Error(`Unknown Lore tool: ${toolName}`);
+        throw new Error(`Unknown tool: ${toolName}`);
     }
   }
 
-  private async searchKnowledgeBase(args: Record<string, unknown>): Promise<string> {
+  private async searchKnowledgeBase(args: Record<string, unknown>): Promise<ToolExecutionResult> {
     const query = String(args.query ?? "");
     const limit = Number(args.limit ?? 5);
     const params = new URLSearchParams({ q: query, limit: String(limit) });
     const data = await this.fetchJson(`/api/v1/search?${params.toString()}`);
-    if (typeof data?.text === "string" && data.text.length > 0) return data.text;
-    if (Array.isArray(data?.results) && data.results.length === 0) return "No matches found.";
-    return JSON.stringify(data, null, 2);
+    const ids = extractDocIds(data);
+    if (typeof data?.text === "string" && data.text.length > 0) {
+      return { text: data.text, retrievedDocIds: ids };
+    }
+    if (Array.isArray(data?.results) && data.results.length === 0) {
+      return { text: "No matches found.", retrievedDocIds: [] };
+    }
+    return { text: JSON.stringify(data, null, 2), retrievedDocIds: ids };
   }
 
-  private async getDocument(args: Record<string, unknown>): Promise<string> {
+  private async getDocument(args: Record<string, unknown>): Promise<ToolExecutionResult> {
     const id = String(args.id ?? "");
     if (!id) throw new Error("Missing document id");
     const data = await this.fetchJson(`/api/v1/documents/${encodeURIComponent(id)}`);
-    return JSON.stringify(data, null, 2);
+    return { text: JSON.stringify(data, null, 2), retrievedDocIds: [id] };
   }
 
-  private async listDocuments(args: Record<string, unknown>): Promise<string> {
+  private async listDocuments(args: Record<string, unknown>): Promise<ToolExecutionResult> {
     const limit = Number(args.limit ?? 50);
     const offset = Number(args.offset ?? 0);
     const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
     const data = await this.fetchJson(`/api/v1/documents?${params.toString()}`);
-    return JSON.stringify(data, null, 2);
+    return { text: JSON.stringify(data, null, 2), retrievedDocIds: extractDocIds(data) };
   }
 
   private async fetchJson(endpoint: string): Promise<{ text?: string; results?: unknown[] } & Record<string, unknown>> {
@@ -113,8 +121,29 @@ export class LoreAdapter implements PlatformAdapter {
         const body = (await response.json()) as { error?: string };
         if (body.error) message = body.error;
       } catch {}
-      throw new Error(`Lore API error (${response.status}): ${message}`);
+      throw new Error(`API error (${response.status}): ${message}`);
     }
     return (await response.json()) as { text?: string; results?: unknown[] } & Record<string, unknown>;
   }
+}
+
+function extractDocIds(data: unknown): string[] {
+  const ids = new Set<string>();
+  const visit = (value: unknown): void => {
+    if (value === null || value === undefined) return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (typeof value === "object") {
+      const obj = value as Record<string, unknown>;
+      for (const key of ["document_id", "doc_id", "id"]) {
+        const v = obj[key];
+        if (typeof v === "string") ids.add(v);
+      }
+      for (const v of Object.values(obj)) visit(v);
+    }
+  };
+  visit(data);
+  return Array.from(ids);
 }

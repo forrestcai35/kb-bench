@@ -1,8 +1,11 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { createAnthropicClient, type Config } from "./config.js";
+import { withRetry } from "./retry.js";
 import type { BenchmarkQuery, JudgeVerdict, QueryMetrics } from "./types.js";
 
-const JUDGE_SYSTEM = `You are an impartial evaluator scoring a RAG agent's answer to an operational question. You will be given the question, the gold answer, and the agent's answer. Score correctness from 0 to 5:
+const JUDGE_SYSTEM = `You are an impartial evaluator scoring a candidate answer to an operational question against a known-correct reference answer. You will be given the question, the reference answer, and the candidate answer. You do NOT know which system produced the candidate answer, and you must not speculate about it.
+
+Score correctness from 0 to 5:
 
 0 — wrong, hallucinated, or missing
 1 — mostly wrong
@@ -11,15 +14,35 @@ const JUDGE_SYSTEM = `You are an impartial evaluator scoring a RAG agent's answe
 4 — correct, minor omissions
 5 — fully correct and complete
 
+Rules for scoring:
+- Score only on factual correctness vs the reference. Style, verbosity, and phrasing do not matter.
+- Do not penalize the candidate for using different wording if the facts match.
+- Do not reward answers that add plausible-sounding but unverifiable extra details.
+- If the candidate answer admits it could not find the information, score 0.
+
 Return STRICT JSON only: {"score": <0-5>, "reasoning": "<one sentence>"}`;
+
+const PLATFORM_NAME_BLACKLIST = [
+  "lore",
+  "notion",
+  "confluence",
+  "obsidian",
+  "atlassian",
+  "knowledge base",
+  "local rest api",
+  "vault",
+  "wiki",
+];
 
 export class Judge {
   private readonly client: Anthropic;
   private readonly model: string;
+  private readonly retries: number;
 
   constructor(config: Config) {
     this.client = createAnthropicClient(config);
-    this.model = config.model;
+    this.model = config.judgeModel;
+    this.retries = config.retries;
   }
 
   async score(query: BenchmarkQuery, result: QueryMetrics): Promise<JudgeVerdict> {
@@ -27,27 +50,34 @@ export class Judge {
       return {
         queryId: query.id,
         platform: result.platform,
+        run: result.run,
         score: 0,
         reasoning: result.error ?? "No answer produced",
       };
     }
 
+    const sanitized = sanitizeAnswer(result.answer);
     const prompt = `Question: ${query.question}
 
-Gold answer: ${query.goldAnswer}
+Reference answer: ${query.goldAnswer}
 
-Agent answer: ${result.answer}
+Candidate answer: ${sanitized}
 
-Score the agent's answer. Return JSON only.`;
+Score the candidate answer. Return JSON only.`;
 
-    const response = await this.client.messages.create({
-      model: this.model,
-      max_tokens: 300,
-      system: JUDGE_SYSTEM,
-      messages: [{ role: "user", content: prompt }],
-      thinking: { type: "adaptive" },
-      output_config: { effort: "low" },
-    });
+    const response = await withRetry(
+      `judge ${query.id} ${result.platform}`,
+      () =>
+        this.client.messages.create({
+          model: this.model,
+          max_tokens: 300,
+          system: JUDGE_SYSTEM,
+          messages: [{ role: "user", content: prompt }],
+          thinking: { type: "adaptive" },
+          output_config: { effort: "low" },
+        }),
+      { retries: this.retries },
+    );
 
     const text = response.content
       .filter((b): b is Anthropic.TextBlock => b.type === "text")
@@ -66,8 +96,22 @@ Score the agent's answer. Return JSON only.`;
     return {
       queryId: query.id,
       platform: result.platform,
+      run: result.run,
       score: Math.max(0, Math.min(5, Number(parsed.score) || 0)),
       reasoning: String(parsed.reasoning ?? ""),
     };
   }
+}
+
+export function sanitizeAnswer(answer: string): string {
+  let cleaned = answer;
+  for (const term of PLATFORM_NAME_BLACKLIST) {
+    const pattern = new RegExp(`\\b${escapeRegex(term)}\\b`, "gi");
+    cleaned = cleaned.replace(pattern, "[KB]");
+  }
+  return cleaned;
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

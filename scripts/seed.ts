@@ -1,33 +1,9 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { Client as NotionClient } from "@notionhq/client";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { getConfig } from "../src/config.js";
+import { loadCorpus } from "../src/dataset.js";
 import { encodeVaultPath } from "../src/adapters/obsidian.js";
-
-interface Section {
-  title: string;
-  body: string;
-}
-
-function parseCorpus(path: string): Section[] {
-  const raw = readFileSync(path, "utf-8");
-  const parts = raw
-    .split(/^---$/m)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-
-  const sections: Section[] = [];
-  for (const part of parts) {
-    const lines = part.split("\n");
-    const headingIndex = lines.findIndex((l) => l.startsWith("## "));
-    if (headingIndex === -1) continue;
-    const title = lines[headingIndex]!.replace(/^##\s+/, "").trim();
-    const body = lines.slice(headingIndex + 1).join("\n").trim();
-    if (title && body) sections.push({ title, body });
-  }
-  return sections;
-}
+import type { CorpusDocument } from "../src/types.js";
 
 async function resolveBenchmarkFolderId(
   supabase: SupabaseClient,
@@ -63,7 +39,7 @@ async function resolveBenchmarkFolderId(
   return (created as { id: string }).id;
 }
 
-async function seedLore(sections: Section[]): Promise<void> {
+async function seedLore(docs: CorpusDocument[]): Promise<void> {
   const config = getConfig();
   if (!config.lore.supabaseUrl) throw new Error("SUPABASE_URL not set");
   if (!config.lore.serviceRoleKey) throw new Error("SUPABASE_SERVICE_ROLE_KEY not set");
@@ -86,10 +62,10 @@ async function seedLore(sections: Section[]): Promise<void> {
   );
 
   let inserted = 0;
-  for (const section of sections) {
+  for (const doc of docs) {
     const payload: Record<string, unknown> = {
-      title: section.title,
-      content: section.body,
+      title: doc.title,
+      content: doc.body,
       source: "Agent",
       status: "Published",
       author: config.lore.author,
@@ -105,13 +81,13 @@ async function seedLore(sections: Section[]): Promise<void> {
       .single();
 
     if (error) {
-      console.error(`  [fail] ${section.title}: ${error.message}`);
+      console.error(`  [fail] ${doc.title}: ${error.message}`);
       continue;
     }
     inserted++;
-    console.log(`  [ok]   ${section.title} → ${(data as { id: string }).id}`);
+    console.log(`  [ok]   ${doc.title} → ${(data as { id: string }).id}`);
   }
-  console.log(`\nLore seed: ${inserted}/${sections.length} inserted.`);
+  console.log(`\nLore seed: ${inserted}/${docs.length} inserted.`);
 
   if (inserted === 0) return;
 
@@ -183,27 +159,30 @@ function markdownToNotionBlocks(markdown: string): unknown[] {
   return blocks;
 }
 
-async function seedNotion(sections: Section[]): Promise<void> {
+async function seedNotion(docs: CorpusDocument[]): Promise<void> {
   const config = getConfig();
   if (!config.notion.token) throw new Error("NOTION_TOKEN not set");
-  const parentId = process.env.NOTION_PARENT_PAGE_ID;
-  if (!parentId) throw new Error("NOTION_PARENT_PAGE_ID not set — the Notion page each runbook will be created under");
+  const parentId = config.notion.parentPageId;
+  if (!parentId) throw new Error("NOTION_PARENT_PAGE_ID not set — the parent page each runbook will be created under");
   const client = new NotionClient({ auth: config.notion.token });
 
-  for (const section of sections) {
+  let inserted = 0;
+  for (const doc of docs) {
     try {
       const res = await client.pages.create({
         parent: { type: "page_id", page_id: parentId },
         properties: {
-          title: { title: [{ type: "text", text: { content: section.title } }] },
+          title: { title: [{ type: "text", text: { content: doc.title } }] },
         },
-        children: markdownToNotionBlocks(section.body) as Parameters<typeof client.pages.create>[0]["children"],
+        children: markdownToNotionBlocks(doc.body) as Parameters<typeof client.pages.create>[0]["children"],
       });
-      console.log(`  [ok]   ${section.title} → ${(res as { id: string }).id}`);
+      inserted++;
+      console.log(`  [ok]   ${doc.title} → ${(res as { id: string }).id}`);
     } catch (err) {
-      console.error(`  [fail] ${section.title}: ${(err as Error).message}`);
+      console.error(`  [fail] ${doc.title}: ${(err as Error).message}`);
     }
   }
+  console.log(`\nNotion seed: ${inserted}/${docs.length} inserted.`);
 }
 
 function escapeXml(s: string): string {
@@ -296,7 +275,7 @@ async function resolveConfluenceSpaceId(
   );
 }
 
-async function seedConfluence(sections: Section[]): Promise<void> {
+async function seedConfluence(docs: CorpusDocument[]): Promise<void> {
   const config = getConfig();
   if (!config.confluence.baseUrl) throw new Error("CONFLUENCE_BASE_URL not set");
   if (!config.confluence.email) throw new Error("CONFLUENCE_EMAIL not set");
@@ -329,14 +308,14 @@ async function seedConfluence(sections: Section[]): Promise<void> {
   console.log(`  [info] Resolved space ${config.confluence.spaceKey} → id ${spaceId}`);
 
   let inserted = 0;
-  for (const section of sections) {
+  for (const doc of docs) {
     const body: Record<string, unknown> = {
       spaceId,
       status: "current",
-      title: section.title,
+      title: doc.title,
       body: {
         representation: "storage",
-        value: markdownToConfluenceStorage(section.body),
+        value: markdownToConfluenceStorage(doc.body),
       },
     };
     if (config.confluence.parentPageId) body.parentId = config.confluence.parentPageId;
@@ -347,19 +326,19 @@ async function seedConfluence(sections: Section[]): Promise<void> {
         body: JSON.stringify(body),
       })) as { id: string };
       inserted++;
-      console.log(`  [ok]   ${section.title} → ${created.id}`);
+      console.log(`  [ok]   ${doc.title} → ${created.id}`);
     } catch (err) {
-      console.error(`  [fail] ${section.title}: ${(err as Error).message}`);
+      console.error(`  [fail] ${doc.title}: ${(err as Error).message}`);
     }
   }
-  console.log(`\nConfluence seed: ${inserted}/${sections.length} inserted.`);
+  console.log(`\nConfluence seed: ${inserted}/${docs.length} inserted.`);
 }
 
 function sanitizeObsidianFilename(name: string): string {
   return name.replace(/[\\/:*?"<>|#^[\]]/g, "-").replace(/\s+/g, " ").trim();
 }
 
-async function seedObsidian(sections: Section[]): Promise<void> {
+async function seedObsidian(docs: CorpusDocument[]): Promise<void> {
   const config = getConfig();
   if (!config.obsidian.apiKey) throw new Error("OBSIDIAN_API_KEY not set");
   const apiUrl = config.obsidian.apiUrl.replace(/\/$/, "");
@@ -373,10 +352,10 @@ async function seedObsidian(sections: Section[]): Promise<void> {
 
   let inserted = 0;
   try {
-    for (const section of sections) {
-      const filename = `${sanitizeObsidianFilename(section.title)}.md`;
+    for (const doc of docs) {
+      const filename = `${sanitizeObsidianFilename(doc.title)}.md`;
       const relPath = folder ? `${folder}/${filename}` : filename;
-      const body = `# ${section.title}\n\n${section.body}\n`;
+      const body = `# ${doc.title}\n\n${doc.body}\n`;
 
       try {
         const response = await fetch(`${apiUrl}/vault/${encodeVaultPath(relPath)}`, {
@@ -392,9 +371,9 @@ async function seedObsidian(sections: Section[]): Promise<void> {
           throw new Error(`${response.status}: ${text}`);
         }
         inserted++;
-        console.log(`  [ok]   ${section.title} → ${relPath}`);
+        console.log(`  [ok]   ${doc.title} → ${relPath}`);
       } catch (err) {
-        console.error(`  [fail] ${section.title}: ${(err as Error).message}`);
+        console.error(`  [fail] ${doc.title}: ${(err as Error).message}`);
       }
     }
   } finally {
@@ -403,39 +382,33 @@ async function seedObsidian(sections: Section[]): Promise<void> {
       else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previous;
     }
   }
-  console.log(`\nObsidian seed: ${inserted}/${sections.length} inserted.`);
+  console.log(`\nObsidian seed: ${inserted}/${docs.length} inserted.`);
 }
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const platformIdx = args.indexOf("--platform");
-  const corpusIdx = args.indexOf("--corpus");
   const platform = platformIdx >= 0 ? args[platformIdx + 1] : undefined;
-  const corpusPath = corpusIdx >= 0 ? args[corpusIdx + 1] : resolve("corpus/sample-runbooks.md");
   if (!platform) {
-    console.error("Usage: tsx scripts/seed.ts --platform <lore|notion|confluence|obsidian> [--corpus path.md]");
-    process.exit(1);
-  }
-  if (!corpusPath) {
-    console.error("Missing corpus path");
+    console.error("Usage: tsx scripts/seed.ts --platform <lore|notion|confluence|obsidian>");
     process.exit(1);
   }
 
-  const sections = parseCorpus(corpusPath);
-  console.log(`Parsed ${sections.length} sections from ${corpusPath}\n=== Seeding ${platform} ===`);
+  const docs = loadCorpus();
+  console.log(`Loaded ${docs.length} documents from data/corpus\n=== Seeding ${platform} ===`);
 
   switch (platform) {
     case "lore":
-      await seedLore(sections);
+      await seedLore(docs);
       break;
     case "notion":
-      await seedNotion(sections);
+      await seedNotion(docs);
       break;
     case "confluence":
-      await seedConfluence(sections);
+      await seedConfluence(docs);
       break;
     case "obsidian":
-      await seedObsidian(sections);
+      await seedObsidian(docs);
       break;
     default:
       console.error(`Unknown platform: ${platform}`);
