@@ -29,9 +29,10 @@ Rules for scoring:
 Return STRICT JSON only: {"score": <0-5>, "reasoning": "<one sentence>"}`;
 
 export function familyOfModel(model: string): JudgeFamily | null {
-  if (/^claude/i.test(model)) return "anthropic";
-  if (/^gpt|^o\d|^chatgpt/i.test(model)) return "openai";
-  if (/^gemini/i.test(model)) return "google";
+  const normalized = model.toLowerCase().replace(/^[^/]+\//, "");
+  if (/^claude/.test(normalized)) return "anthropic";
+  if (/^(gpt|o\d|chatgpt)/.test(normalized)) return "openai";
+  if (/^gemini/.test(normalized)) return "google";
   return null;
 }
 

@@ -60,7 +60,7 @@ export class Judge {
 
     if (backends.length === 0) {
       throw new Error(
-        "No judge backends available. Provide credentials for at least one of: Anthropic (ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY), OpenAI (OPENAI_API_KEY), Google (GOOGLE_API_KEY). Current judge panel: " +
+        "No judge backends available. Provide credentials for at least one of: Anthropic (ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY), OpenAI/OpenRouter (OPENAI_API_KEY / OPENROUTER_API_KEY), Google Gemini (GOOGLE_API_KEY / GEMINI_API_KEY / FREE_GEMINI_API_KEY_N). Current judge panel: " +
           config.judgeModels.join(", "),
       );
     }

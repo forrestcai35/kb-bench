@@ -317,6 +317,9 @@ describe("judge helpers", () => {
     expect(familyOfModel("gpt-4.1")).toBe("openai");
     expect(familyOfModel("o3")).toBe("openai");
     expect(familyOfModel("gemini-2.5-pro")).toBe("google");
+    expect(familyOfModel("anthropic/claude-sonnet-4-6")).toBe("anthropic");
+    expect(familyOfModel("openai/gpt-5")).toBe("openai");
+    expect(familyOfModel("google/gemini-2.5-flash:free")).toBe("google");
     expect(familyOfModel("mistral-large")).toBeNull();
   });
 });

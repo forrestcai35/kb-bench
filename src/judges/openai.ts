@@ -21,10 +21,13 @@ export class OpenAIJudge implements JudgeBackend {
     if (!apiKey) {
       this.client = null;
       this.available = false;
-      this.unavailableReason = "OPENAI_API_KEY not set";
+      this.unavailableReason = "OPENAI_API_KEY or OPENROUTER_API_KEY not set";
       return;
     }
-    this.client = new OpenAI({ apiKey });
+    this.client = new OpenAI({
+      apiKey,
+      baseURL: config.openai.baseUrl,
+    });
     this.available = true;
   }
 

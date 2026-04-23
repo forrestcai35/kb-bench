@@ -78,8 +78,10 @@ git clone https://github.com/forrestcai/kb-bench
 cd kb-bench
 npm install
 cp .env.example .env
-# fill in at least ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY)
-# + credentials for at least one platform
+# fill in at least ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY) for the agent
+# fill in OPENAI_API_KEY or OPENROUTER_API_KEY for the OpenAI-family judge
+# fill in GOOGLE_API_KEY, GEMINI_API_KEY, or FREE_GEMINI_API_KEY_1 for Gemini judging
+# fill in credentials for at least one platform
 npm run seed -- --platform notion         # once per platform
 npm run bench -- --runs 3                 # all platforms, 3 runs each
 ```
@@ -214,9 +216,18 @@ cost ([Verga et al., "Replacing Judges with Juries," 2024](https://arxiv.org/abs
 
 | Judge | Env var | Model |
 | --- | --- | --- |
-| Anthropic | `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` | `claude-opus-4-7` |
-| OpenAI | `OPENAI_API_KEY` | `gpt-4.1` |
-| Google | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | `gemini-2.5-pro` |
+| Anthropic | `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` |
+| OpenAI-family | `OPENAI_API_KEY` / `OPENROUTER_API_KEY` | `gpt-5.4` |
+| Google | `GOOGLE_API_KEY` / `GEMINI_API_KEY` / `FREE_GEMINI_API_KEY_N` | `gemini-3-pro` |
+
+The default agent-under-test is also `claude-sonnet-4-6` (Opus 4.7 is ~5×
+more expensive per token). Override either via `BENCH_MODEL` and
+`BENCH_JUDGE_MODELS`.
+
+In `.env`, set `OPENAI_API_KEY` or `OPENROUTER_API_KEY` to enable the
+OpenAI-family judge. For Gemini, set `GOOGLE_API_KEY`, `GEMINI_API_KEY`, or
+one or more `FREE_GEMINI_API_KEY_N` entries; pooled free-tier keys are rotated
+on quota exhaustion.
 
 Override the panel with `BENCH_JUDGE_MODELS` (comma-separated). Each model
 is routed to the SDK that matches its prefix (`claude-*` → Anthropic,

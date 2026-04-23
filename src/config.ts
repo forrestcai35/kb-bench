@@ -8,6 +8,32 @@ function optionalEnv(name: string): string | undefined {
   return process.env[name];
 }
 
+function freeGeminiApiKeys(): string[] {
+  return dedupe(
+    Object.entries(process.env)
+      .filter(([name, value]) => /^FREE_GEMINI_API_KEY(?:_\d+)?$/.test(name) && Boolean(value))
+      .sort(([a], [b]) => freeGeminiKeyOrder(a) - freeGeminiKeyOrder(b) || a.localeCompare(b))
+      .map(([, value]) => value!)
+      .filter((value) => value.length > 0),
+  );
+}
+
+function freeGeminiKeyOrder(name: string): number {
+  const match = name.match(/^FREE_GEMINI_API_KEY(?:_(\d+))?$/);
+  return Number(match?.[1] ?? 0);
+}
+
+function dedupe(values: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+  }
+  return result;
+}
+
 function parseList(value: string | undefined): string[] {
   if (!value) return [];
   return value
@@ -30,9 +56,11 @@ export interface Config {
   topK: number;
   openai: {
     apiKey: string | undefined;
+    baseUrl: string | undefined;
   };
   google: {
     apiKey: string | undefined;
+    apiKeys: string[];
   };
   lore: {
     apiUrl: string;
@@ -80,6 +108,10 @@ export function getConfig(): Config {
     : singleJudge
       ? [singleJudge]
       : DEFAULT_JUDGE_PANEL;
+  const openaiApiKey = optionalEnv("OPENAI_API_KEY");
+  const openrouterApiKey = optionalEnv("OPENROUTER_API_KEY");
+  const googleApiKey = optionalEnv("GOOGLE_API_KEY") ?? optionalEnv("GEMINI_API_KEY");
+  const googleApiKeys = dedupe([googleApiKey, ...freeGeminiApiKeys()]);
 
   return {
     anthropicApiKey: optionalEnv("ANTHROPIC_API_KEY"),
@@ -95,10 +127,16 @@ export function getConfig(): Config {
     runsPerQuery: Number(optionalEnv("BENCH_RUNS") ?? "1"),
     topK: Number(optionalEnv("BENCH_TOP_K") ?? "5"),
     openai: {
-      apiKey: optionalEnv("OPENAI_API_KEY"),
+      apiKey: openaiApiKey ?? openrouterApiKey,
+      baseUrl: openaiApiKey
+        ? optionalEnv("OPENAI_BASE_URL")
+        : openrouterApiKey
+          ? optionalEnv("OPENROUTER_BASE_URL") ?? "https://openrouter.ai/api/v1"
+          : optionalEnv("OPENAI_BASE_URL"),
     },
     google: {
-      apiKey: optionalEnv("GOOGLE_API_KEY") ?? optionalEnv("GEMINI_API_KEY"),
+      apiKey: googleApiKeys[0],
+      apiKeys: googleApiKeys,
     },
     lore: {
       apiUrl: optionalEnv("LORE_API_URL") ?? "https://lightfield.app",
