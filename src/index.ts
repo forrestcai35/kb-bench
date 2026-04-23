@@ -134,12 +134,14 @@ async function main(): Promise<void> {
   }
 
   const agent = new BenchmarkAgent(config);
-  const judge = new Judge(config);
 
   const pricing = pricingForModel(config.model);
+  const judge = new Judge(config);
+  const panel = judge.panel;
   const environment: RunEnvironment = {
     model: config.model,
-    judgeModel: config.judgeModel,
+    judgeModels: panel.map((b) => b.id),
+    excludeSameFamilyJudge: config.excludeSameFamilyJudge,
     effort: config.effort,
     maxTurns: config.maxTurns,
     maxTokens: config.maxTokens,
@@ -153,6 +155,7 @@ async function main(): Promise<void> {
     queriesHash: dataset.queriesHash,
     benchVersion: benchVersion(),
   };
+  console.log(`Judge panel: ${panel.map((b) => b.id).join(", ")}${config.excludeSameFamilyJudge ? " (same-family judge excluded)" : ""}`);
 
   const runStartedAt = new Date().toISOString();
   const results: QueryMetrics[] = [];

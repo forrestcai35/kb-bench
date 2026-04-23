@@ -64,17 +64,33 @@ export type ErrorType =
   | "no_answer"
   | "unknown";
 
+export interface JudgeScore {
+  judgeId: string;
+  model: string;
+  family: string;
+  score: number;
+  reasoning: string;
+  excluded?: boolean;
+  excludedReason?: string;
+  error?: string;
+}
+
 export interface JudgeVerdict {
   queryId: string;
   platform: string;
   run: number;
   score: number;
+  meanScore: number;
+  medianScore: number;
+  stddev: number;
   reasoning: string;
+  perJudge: JudgeScore[];
 }
 
 export interface RunEnvironment {
   model: string;
-  judgeModel: string;
+  judgeModels: string[];
+  excludeSameFamilyJudge: boolean;
   effort: string;
   maxTurns: number;
   maxTokens: number;

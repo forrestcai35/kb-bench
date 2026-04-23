@@ -9,8 +9,11 @@ each one.
 
 For every (platform, query, run) triple it records:
 
-- **Correctness** — a judge score 0–5 from an LLM judge that is blinded to
-  which platform produced the answer.
+- **Correctness** — a mean score 0–5 from a **cross-family jury** of LLM
+  judges (Anthropic + OpenAI + Google by default). The candidate's own family
+  is excluded from its own panel to mitigate self-preference bias. Judges
+  never see which platform produced an answer, and platform names are
+  scrubbed from the candidate answer before scoring.
 - **Retrieval quality** — recall, precision, MRR, and nDCG against annotated
   gold documents. The agent's tool calls are inspected, not its prose.
 - **Cost** — input tokens, output tokens, and **tool-result tokens** (how much
@@ -40,9 +43,14 @@ invariants — if you find one being violated, please open an issue.
 3. **Identical tool contract.** Every adapter exposes exactly `search`,
    `fetch`, and `list` with matching parameter schemas. Tool descriptions are
    structurally the same.
-4. **Blind judge.** The judge never sees which platform produced an answer.
-   The candidate answer is additionally scrubbed for platform names
-   (`Notion`, `Obsidian`, etc.) before scoring.
+4. **Blind cross-family jury.** Scoring uses a panel of ≥3 LLM judges from
+   different providers, aggregated by mean. The candidate's own family is
+   dropped from its own panel. This mitigates self-preference bias, which is
+   a well-documented LLM-as-judge failure mode
+   ([Panickssery et al., 2024](https://arxiv.org/abs/2404.13076);
+   [Verga et al., 2024](https://arxiv.org/abs/2404.18796)). Judges never see
+   the platform name, and the candidate answer is additionally scrubbed of
+   platform identifiers (`Notion`, `Obsidian`, etc.) before scoring.
 5. **No prompt caching.** `cache_control` is deliberately unset; cache hits
    would skew comparative measurements.
 6. **Deterministic-ish but measured.** Pass `--runs N` to average across N
@@ -193,17 +201,56 @@ All API and tool calls are retried with exponential backoff (with a hint from
 `Retry-After`) on rate limits, connection errors, and 5xx. `BENCH_RETRIES`
 controls the count.
 
-### Judge
+### Judging — cross-family jury
 
-The judge is the same model by default (configurable via `BENCH_JUDGE_MODEL`).
-It sees:
+`kb-bench` uses an **LLM-as-a-jury** setup rather than a single-judge setup.
+Single-judge setups are biased toward outputs of the judge's own family (the
+"self-preference" bias, formally measured in
+[Panickssery et al., 2024](https://arxiv.org/abs/2404.13076)); multi-judge
+panels from different providers correlate better with humans at a lower
+cost ([Verga et al., "Replacing Judges with Juries," 2024](https://arxiv.org/abs/2404.18796)).
+
+**Default panel:**
+
+| Judge | Env var | Model |
+| --- | --- | --- |
+| Anthropic | `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` | `claude-opus-4-7` |
+| OpenAI | `OPENAI_API_KEY` | `gpt-4.1` |
+| Google | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | `gemini-2.5-pro` |
+
+Override the panel with `BENCH_JUDGE_MODELS` (comma-separated). Each model
+is routed to the SDK that matches its prefix (`claude-*` → Anthropic,
+`gpt-*` / `o*` → OpenAI, `gemini-*` → Google).
+
+Every judge sees the same prompt:
 
 - The question
 - The reference answer from `queries.jsonl`
-- The candidate answer (with platform names scrubbed to `[KB]`)
+- The candidate answer, with platform identifiers scrubbed to `[KB]`
 
-It does not see which platform produced the candidate. It scores 0–5 on
-factual correctness only.
+The judge does not see which platform produced the candidate. It scores 0–5
+on factual correctness only.
+
+**Aggregation.** Scores are combined by arithmetic mean across non-excluded
+judges. The report also shows the median and the cross-judge standard
+deviation so you can spot rows where the panel disagreed.
+
+**Same-family exclusion.** If the candidate model's family (e.g.,
+`claude-opus-4-7` → `anthropic`) matches a judge's family, that judge is
+excluded from the panel for all queries in that run. Disable with
+`BENCH_EXCLUDE_SAME_FAMILY_JUDGE=false` if you have a reason to keep the
+same-family judge in the panel (e.g., intentional ablation).
+
+**Inter-judge agreement.** Every report includes Krippendorff's α
+(interval) and the mean pairwise Pearson correlation across judges. Typical
+interpretation: α ≥ 0.80 is strong, 0.67–0.80 is tentative, anything below
+0.67 is reader-level disagreement — small platform differences on that run
+should not be treated as decisive.
+
+**Single-judge fallback.** If only one provider's credentials are set, the
+benchmark will run with a single-judge panel and log a warning. The report
+still works; you just lose the self-preference mitigation and the agreement
+stats.
 
 ### Retrieval metrics
 
@@ -230,8 +277,10 @@ pricing table; the benchmark does not hardcode any discount.
 - **Corpus size.** 20 documents is small. Platforms whose response size scales
   with corpus size (Notion, Confluence) may look better than they would on
   an enterprise-scale corpus.
-- **Judge variance.** An LLM judge is not a human evaluator. Low scores are
-  often judge quirks. Use `--runs N ≥ 3` and spot-check.
+- **Judge variance.** Even a cross-family jury is noisier than expert human
+  evaluation. For public comparisons use `--runs N ≥ 3`, inspect the
+  per-judge breakdown for disagreement, and spot-check low-scoring rows
+  against the reference answer.
 - **Single model family.** Current adapters and the agent loop use the
   Anthropic SDK. Porting the agent loop to OpenAI / Gemini is in scope —
   contributions welcome.

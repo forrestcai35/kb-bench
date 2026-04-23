@@ -1,26 +1,15 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { createAnthropicClient, type Config } from "./config.js";
-import { withRetry } from "./retry.js";
-import type { BenchmarkQuery, JudgeVerdict, QueryMetrics } from "./types.js";
-
-const JUDGE_SYSTEM = `You are an impartial evaluator scoring a candidate answer to an operational question against a known-correct reference answer. You will be given the question, the reference answer, and the candidate answer. You do NOT know which system produced the candidate answer, and you must not speculate about it.
-
-Score correctness from 0 to 5:
-
-0 — wrong, hallucinated, or missing
-1 — mostly wrong
-2 — partially correct but misses key facts
-3 — roughly correct, some details off
-4 — correct, minor omissions
-5 — fully correct and complete
-
-Rules for scoring:
-- Score only on factual correctness vs the reference. Style, verbosity, and phrasing do not matter.
-- Do not penalize the candidate for using different wording if the facts match.
-- Do not reward answers that add plausible-sounding but unverifiable extra details.
-- If the candidate answer admits it could not find the information, score 0.
-
-Return STRICT JSON only: {"score": <0-5>, "reasoning": "<one sentence>"}`;
+import type { Config } from "./config.js";
+import { AnthropicJudge } from "./judges/anthropic.js";
+import { OpenAIJudge } from "./judges/openai.js";
+import { GoogleJudge } from "./judges/google.js";
+import {
+  SHARED_JUDGE_SYSTEM,
+  familyOfModel,
+  parseScore,
+  type JudgeBackend,
+  type JudgeFamily,
+} from "./judges/base.js";
+import type { BenchmarkQuery, JudgeScore, JudgeVerdict, QueryMetrics } from "./types.js";
 
 const PLATFORM_NAME_BLACKLIST = [
   "lore",
@@ -35,29 +24,89 @@ const PLATFORM_NAME_BLACKLIST = [
 ];
 
 export class Judge {
-  private readonly client: Anthropic;
-  private readonly model: string;
-  private readonly retries: number;
+  private readonly backends: JudgeBackend[];
+  private readonly excludeSameFamily: boolean;
+  private readonly candidateFamily: JudgeFamily | null;
 
   constructor(config: Config) {
-    this.client = createAnthropicClient(config);
-    this.model = config.judgeModel;
-    this.retries = config.retries;
+    this.excludeSameFamily = config.excludeSameFamilyJudge;
+    this.candidateFamily = familyOfModel(config.model);
+
+    const backends: JudgeBackend[] = [];
+    for (const model of config.judgeModels) {
+      const family = familyOfModel(model);
+      if (!family) {
+        console.warn(`[judge] Skipping unknown judge family for model: ${model}`);
+        continue;
+      }
+      let backend: JudgeBackend;
+      switch (family) {
+        case "anthropic":
+          backend = new AnthropicJudge(config, model);
+          break;
+        case "openai":
+          backend = new OpenAIJudge(config, model);
+          break;
+        case "google":
+          backend = new GoogleJudge(config, model);
+          break;
+      }
+      if (!backend.available) {
+        console.warn(`[judge] ${backend.id} unavailable: ${backend.unavailableReason}`);
+        continue;
+      }
+      backends.push(backend);
+    }
+
+    if (backends.length === 0) {
+      throw new Error(
+        "No judge backends available. Provide credentials for at least one of: Anthropic (ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY), OpenAI (OPENAI_API_KEY), Google (GOOGLE_API_KEY). Current judge panel: " +
+          config.judgeModels.join(", "),
+      );
+    }
+
+    this.backends = backends;
+    const families = new Set(backends.map((b) => b.family));
+    if (backends.length === 1) {
+      console.warn(
+        `[judge] Running with a single-judge panel (${backends[0]!.id}). A public benchmark should use >=3 judges from different families.`,
+      );
+    } else if (families.size === 1) {
+      console.warn(
+        `[judge] All judges come from the same family (${[...families].join(", ")}). Consider adding cross-family judges for fairness.`,
+      );
+    }
+  }
+
+  get panel(): JudgeBackend[] {
+    return this.backends;
   }
 
   async score(query: BenchmarkQuery, result: QueryMetrics): Promise<JudgeVerdict> {
     if (result.error || !result.answer) {
+      const reason = result.error ?? "No answer produced";
       return {
         queryId: query.id,
         platform: result.platform,
         run: result.run,
         score: 0,
-        reasoning: result.error ?? "No answer produced",
+        meanScore: 0,
+        medianScore: 0,
+        stddev: 0,
+        reasoning: reason,
+        perJudge: this.backends.map((b) => ({
+          judgeId: b.id,
+          model: b.model,
+          family: b.family,
+          score: 0,
+          reasoning: reason,
+          error: result.error,
+        })),
       };
     }
 
     const sanitized = sanitizeAnswer(result.answer);
-    const prompt = `Question: ${query.question}
+    const userPrompt = `Question: ${query.question}
 
 Reference answer: ${query.goldAnswer}
 
@@ -65,42 +114,77 @@ Candidate answer: ${sanitized}
 
 Score the candidate answer. Return JSON only.`;
 
-    const response = await withRetry(
-      `judge ${query.id} ${result.platform}`,
-      () =>
-        this.client.messages.create({
-          model: this.model,
-          max_tokens: 300,
-          system: JUDGE_SYSTEM,
-          messages: [{ role: "user", content: prompt }],
-          thinking: { type: "adaptive" },
-          output_config: { effort: "low" },
-        }),
-      { retries: this.retries },
+    const perJudge = await Promise.all(
+      this.backends.map(async (backend): Promise<JudgeScore> => {
+        if (this.excludeSameFamily && this.candidateFamily && backend.family === this.candidateFamily) {
+          return {
+            judgeId: backend.id,
+            model: backend.model,
+            family: backend.family,
+            score: 0,
+            reasoning: "Excluded: same family as candidate model",
+            excluded: true,
+            excludedReason: `Candidate family ${this.candidateFamily} matches judge family`,
+          };
+        }
+        try {
+          const raw = await backend.score(SHARED_JUDGE_SYSTEM, userPrompt);
+          const parsed = parseScore(raw);
+          return {
+            judgeId: backend.id,
+            model: backend.model,
+            family: backend.family,
+            score: parsed.score,
+            reasoning: parsed.reasoning,
+          };
+        } catch (error) {
+          return {
+            judgeId: backend.id,
+            model: backend.model,
+            family: backend.family,
+            score: 0,
+            reasoning: `judge error: ${(error as Error).message}`,
+            error: (error as Error).message,
+          };
+        }
+      }),
     );
 
-    const text = response.content
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("\n")
-      .trim();
-
-    let parsed: { score: number; reasoning: string };
-    try {
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      parsed = JSON.parse(jsonMatch ? jsonMatch[0] : text) as { score: number; reasoning: string };
-    } catch {
-      parsed = { score: 0, reasoning: `Judge returned unparsable output: ${text.slice(0, 200)}` };
-    }
+    const valid = perJudge.filter((j) => !j.excluded && !j.error);
+    const scores = valid.map((j) => j.score);
+    const mean = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
+    const median = scores.length > 0 ? computeMedian(scores) : 0;
+    const stddev = stdev(scores);
+    const reasoningDigest = valid.map((j) => `${j.judgeId}: ${j.reasoning}`).join(" | ");
 
     return {
       queryId: query.id,
       platform: result.platform,
       run: result.run,
-      score: Math.max(0, Math.min(5, Number(parsed.score) || 0)),
-      reasoning: String(parsed.reasoning ?? ""),
+      score: mean,
+      meanScore: mean,
+      medianScore: median,
+      stddev,
+      reasoning: reasoningDigest,
+      perJudge,
     };
   }
+}
+
+function computeMedian(nums: number[]): number {
+  const sorted = [...nums].sort((a, b) => a - b);
+  const n = sorted.length;
+  if (n === 0) return 0;
+  if (n % 2 === 1) return sorted[(n - 1) / 2]!;
+  return (sorted[n / 2 - 1]! + sorted[n / 2]!) / 2;
+}
+
+function stdev(nums: number[]): number {
+  const n = nums.length;
+  if (n <= 1) return 0;
+  const mean = nums.reduce((a, b) => a + b, 0) / n;
+  const variance = nums.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1);
+  return Math.sqrt(variance);
 }
 
 export function sanitizeAnswer(answer: string): string {

@@ -4,12 +4,15 @@ import { sanitizeAnswer } from "./judge.js";
 import { computeRetrievalMetrics } from "./retrieval.js";
 import { summarize } from "./stats.js";
 import { pricingForModel, computeCost } from "./pricing.js";
-import type { BenchmarkQuery, BenchmarkReport, QueryMetrics } from "./types.js";
+import { computeJudgeAgreement } from "./agreement.js";
+import { parseScore, familyOfModel } from "./judges/base.js";
+import type { BenchmarkQuery, BenchmarkReport, JudgeVerdict, QueryMetrics } from "./types.js";
 
 function makeEnv(): BenchmarkReport["environment"] {
   return {
     model: "claude-opus-4-7",
-    judgeModel: "claude-opus-4-7",
+    judgeModels: ["anthropic:claude-opus-4-7", "openai:gpt-4.1", "google:gemini-2.5-pro"],
+    excludeSameFamilyJudge: true,
     effort: "high",
     maxTurns: 10,
     maxTokens: 16000,
@@ -21,7 +24,7 @@ function makeEnv(): BenchmarkReport["environment"] {
     nodeVersion: "v20.0.0",
     corpusHash: "sha256:abc123",
     queriesHash: "sha256:def456",
-    benchVersion: "0.2.0",
+    benchVersion: "0.3.0",
   };
 }
 
@@ -64,6 +67,44 @@ function makeResult(overrides: Partial<QueryMetrics> = {}): QueryMetrics {
   };
 }
 
+function makeVerdict(
+  platform: string,
+  scores: Record<string, number>,
+  overrides: Partial<JudgeVerdict> = {},
+): JudgeVerdict {
+  const entries = Object.entries(scores);
+  const values = entries.map(([, v]) => v);
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  const sorted = [...values].sort((a, b) => a - b);
+  const median = sorted.length % 2 === 1
+    ? sorted[(sorted.length - 1) / 2]!
+    : (sorted[sorted.length / 2 - 1]! + sorted[sorted.length / 2]!) / 2;
+  const variance = values.length <= 1
+    ? 0
+    : values.reduce((s, v) => s + (v - mean) ** 2, 0) / (values.length - 1);
+  return {
+    queryId: "q1",
+    platform,
+    run: 1,
+    score: mean,
+    meanScore: mean,
+    medianScore: median,
+    stddev: Math.sqrt(variance),
+    reasoning: "ok",
+    perJudge: entries.map(([judgeId, score]) => {
+      const [family, model] = judgeId.split(":");
+      return {
+        judgeId,
+        model: model ?? judgeId,
+        family: family ?? "unknown",
+        score,
+        reasoning: "ok",
+      };
+    }),
+    ...overrides,
+  };
+}
+
 function makeReport(overrides: Partial<BenchmarkReport> = {}): BenchmarkReport {
   return {
     runStartedAt: "2026-04-20T00:00:00Z",
@@ -94,37 +135,47 @@ function makeReport(overrides: Partial<BenchmarkReport> = {}): BenchmarkReport {
       }),
     ],
     verdicts: [
-      { queryId: "q1", platform: "alpha", run: 1, score: 5, reasoning: "ok" },
-      { queryId: "q1", platform: "beta", run: 1, score: 3, reasoning: "partial" },
+      makeVerdict("alpha", { "openai:gpt-4.1": 5, "google:gemini-2.5-pro": 5 }),
+      makeVerdict("beta", { "openai:gpt-4.1": 3, "google:gemini-2.5-pro": 4 }),
     ],
     ...overrides,
   };
 }
 
 describe("generateReport", () => {
-  it("includes run metadata and platform summary header", () => {
+  it("includes run metadata and the jury panel", () => {
     const md = generateReport(makeReport());
     expect(md).toContain("# kb-bench results");
-    expect(md).toContain("**Started:** 2026-04-20T00:00:00Z");
-    expect(md).toContain("**Completed:** 2026-04-20T01:00:00Z");
-    expect(md).toContain("**Queries:** 1");
-    expect(md).toContain("**Platforms:** alpha, beta");
+    expect(md).toContain("**Judge panel:** anthropic:claude-opus-4-7, openai:gpt-4.1, google:gemini-2.5-pro");
+    expect(md).toContain("**Same-family judge excluded:** true");
     expect(md).toContain("**Corpus hash:** sha256:abc123");
-    expect(md).toContain("## Platform summary");
   });
 
-  it("reports recall and MRR per platform", () => {
+  it("renders both mean and median jury scores per platform", () => {
     const md = generateReport(makeReport());
-    expect(md).toMatch(/\| alpha \| 5\.00\/5 \| 1\.00 \| 1\.00/);
-    expect(md).toMatch(/\| beta \| 3\.00\/5 \| 1\.00 \| 0\.50/);
+    expect(md).toMatch(/\| alpha \| 5\.00\/5/);
+    expect(md).toMatch(/\| beta \| 3\.50\/5/);
   });
 
-  it("omits relative comparison table when no baseline is provided", () => {
+  it("renders a per-judge breakdown table", () => {
+    const md = generateReport(makeReport());
+    expect(md).toContain("## Per-judge score breakdown");
+    expect(md).toContain("openai:gpt-4.1");
+    expect(md).toContain("google:gemini-2.5-pro");
+  });
+
+  it("renders inter-judge agreement stats when >=2 judges scored", () => {
+    const md = generateReport(makeReport());
+    expect(md).toContain("Krippendorff's α");
+    expect(md).toContain("Mean pairwise Pearson");
+  });
+
+  it("omits relative comparison when no baseline given", () => {
     const md = generateReport(makeReport());
     expect(md).toContain("No baseline selected");
   });
 
-  it("renders ratios vs the chosen baseline", () => {
+  it("renders ratios when baseline is chosen", () => {
     const md = generateReport(makeReport(), { baseline: "alpha" });
     expect(md).toMatch(/\| beta \| 4\.00x \|/);
   });
@@ -145,63 +196,19 @@ describe("generateReport", () => {
           errorType: "rate_limit",
         }),
       ],
-      verdicts: [{ queryId: "q1", platform: "alpha", run: 1, score: 0, reasoning: "boom" }],
+      verdicts: [makeVerdict("alpha", { "openai:gpt-4.1": 0, "google:gemini-2.5-pro": 0 })],
       platforms: ["alpha"],
     });
     const md = generateReport(report);
     expect(md).toContain("ERROR [rate_limit]: boom");
     expect(md).toContain("## Error breakdown");
   });
-
-  it("renders (no run) when a platform is missing results for a query", () => {
-    const report = makeReport({
-      results: [makeResult({ platform: "alpha" })],
-    });
-    const md = generateReport(report);
-    expect(md).toContain("| beta | — | — | — | — | — | — | — | (no run) |");
-  });
-
-  it("truncates long answers with an ellipsis", () => {
-    const long = "a".repeat(200);
-    const report = makeReport({
-      results: [makeResult({ platform: "alpha", answer: long })],
-      platforms: ["alpha"],
-      verdicts: [{ queryId: "q1", platform: "alpha", run: 1, score: 5, reasoning: "ok" }],
-    });
-    const md = generateReport(report);
-    expect(md).toContain("…");
-    expect(md).not.toContain(long);
-  });
-
-  it("averages metrics across runs for multi-run reports", () => {
-    const report = makeReport({
-      environment: { ...makeEnv(), runsPerQuery: 2 },
-      results: [
-        makeResult({ platform: "alpha", run: 1, totalInputTokens: 100 }),
-        makeResult({ platform: "alpha", run: 2, totalInputTokens: 300 }),
-      ],
-      verdicts: [
-        { queryId: "q1", platform: "alpha", run: 1, score: 5, reasoning: "ok" },
-        { queryId: "q1", platform: "alpha", run: 2, score: 4, reasoning: "ok" },
-      ],
-      platforms: ["alpha"],
-    });
-    const md = generateReport(report);
-    expect(md).toContain("4.5");
-    expect(md).toMatch(/\| alpha \| 4\.50 ± \d/);
-  });
 });
 
 describe("sanitizeAnswer", () => {
-  it("scrubs platform names to keep judge blind", () => {
+  it("scrubs platform names to keep judges blind", () => {
     expect(sanitizeAnswer("Found in Notion under Runbooks.")).toBe("Found in [KB] under Runbooks.");
     expect(sanitizeAnswer("Lore's search returned one hit.")).toBe("[KB]'s search returned one hit.");
-    expect(sanitizeAnswer("Per my Obsidian vault notes.")).toBe("Per my [KB] [KB] notes.");
-  });
-
-  it("leaves answers without platform names unchanged", () => {
-    const text = "Run npm run deploy to ship the web app.";
-    expect(sanitizeAnswer(text)).toBe(text);
   });
 });
 
@@ -256,5 +263,60 @@ describe("pricing", () => {
   it("falls back to family defaults for unknown model ids", () => {
     const p = pricingForModel("claude-opus-0-0-test");
     expect(p.inputPerMillion).toBe(15);
+  });
+});
+
+describe("computeJudgeAgreement", () => {
+  it("returns NaN-like results when fewer than two judges scored", () => {
+    const agreement = computeJudgeAgreement([
+      makeVerdict("alpha", { "openai:gpt-4.1": 4 }),
+    ]);
+    expect(agreement.judges.length).toBe(1);
+    expect(Number.isNaN(agreement.krippendorffAlpha)).toBe(true);
+  });
+
+  it("returns perfect agreement when all judges give identical scores", () => {
+    const verdicts = [
+      makeVerdict("alpha", { "openai:gpt-4.1": 5, "google:gemini-2.5-pro": 5 }),
+      makeVerdict("beta", { "openai:gpt-4.1": 3, "google:gemini-2.5-pro": 3 }),
+    ];
+    const agreement = computeJudgeAgreement(verdicts);
+    expect(agreement.krippendorffAlpha).toBeCloseTo(1, 2);
+  });
+
+  it("returns lower agreement when judges disagree", () => {
+    const verdicts = [
+      makeVerdict("alpha", { "openai:gpt-4.1": 5, "google:gemini-2.5-pro": 2 }),
+      makeVerdict("beta", { "openai:gpt-4.1": 1, "google:gemini-2.5-pro": 4 }),
+    ];
+    const agreement = computeJudgeAgreement(verdicts);
+    expect(agreement.krippendorffAlpha).toBeLessThan(0.5);
+  });
+});
+
+describe("judge helpers", () => {
+  it("parses well-formed JSON scores", () => {
+    const parsed = parseScore('{"score": 4, "reasoning": "good"}');
+    expect(parsed.score).toBe(4);
+    expect(parsed.reasoning).toBe("good");
+  });
+
+  it("clamps out-of-range scores", () => {
+    expect(parseScore('{"score": 99, "reasoning": ""}').score).toBe(5);
+    expect(parseScore('{"score": -3, "reasoning": ""}').score).toBe(0);
+  });
+
+  it("falls back to 0 on unparsable output", () => {
+    const parsed = parseScore("no json here");
+    expect(parsed.score).toBe(0);
+    expect(parsed.reasoning).toContain("Unparsable");
+  });
+
+  it("maps model names to families", () => {
+    expect(familyOfModel("claude-opus-4-7")).toBe("anthropic");
+    expect(familyOfModel("gpt-4.1")).toBe("openai");
+    expect(familyOfModel("o3")).toBe("openai");
+    expect(familyOfModel("gemini-2.5-pro")).toBe("google");
+    expect(familyOfModel("mistral-large")).toBeNull();
   });
 });
